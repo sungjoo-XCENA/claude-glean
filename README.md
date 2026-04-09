@@ -14,8 +14,15 @@ python3 server.py
 
 Open `http://localhost:8080`. That's it.
 
+Custom port:
+
+```bash
+python3 server.py -p 3000        # port 3000
+python3 server.py --host 127.0.0.1  # localhost only
+```
+
 - Python 3.9+ (stdlib only, zero dependencies)
-- Binds to `0.0.0.0:8080` — accessible from other machines on the same network
+- Default: `0.0.0.0:8080` — accessible from other machines via `http://<your-ip>:8080`
 
 ## What It Solves
 
