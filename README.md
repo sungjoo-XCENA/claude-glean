@@ -1,10 +1,10 @@
 # claude-glean
 
-Real-time Claude Code workspace monitor. A local web dashboard that gives you a single-screen overview of all your Claude Code sessions, instructions, skills, agents, connectors, hooks, plugins, forks, and projects.
+A local dashboard that **gathers scattered Claude Code workspace data into one screen** — sessions, instructions, context usage, forks, skills, agents, connectors, hooks, plugins, and projects.
 
 <img width="1429" height="1857" alt="image" src="https://github.com/user-attachments/assets/2d03bb5f-4a18-423c-8883-d97de72cc893" />
 
-> **Read-only by default** — the dashboard reads from `~/.claude/` and never modifies files unless you explicitly click a Delete button.
+> **Read-only by default** — reads from `~/.claude/` and never modifies files unless you explicitly click Delete.
 
 ## Quick Start
 
@@ -12,119 +12,69 @@ Real-time Claude Code workspace monitor. A local web dashboard that gives you a 
 python3 server.py
 ```
 
-Open `http://localhost:8080` in your browser. That's it.
+Open `http://localhost:8080`. That's it.
 
-- Python 3.9+ required (stdlib only, zero external dependencies)
-- Bind to all interfaces by default (`0.0.0.0:8080`), accessible from other machines on the same network
+- Python 3.9+ (stdlib only, zero dependencies)
+- Binds to `0.0.0.0:8080` — accessible from other machines on the same network
 
-## Why
+## What It Solves
 
-If you run multiple Claude Code sessions across different repos, you've probably experienced:
+### Session confusion
+**Problem**: Five terminals open, no idea which is doing what.
+**Solution**: All active sessions in one view with name, project, and status. Click to see Context X-ray with real token usage.
 
-- **"Which terminal is doing what?"** — hard to track active sessions
-- **"Did I set up CLAUDE.md for this repo?"** — instructions scattered across projects
-- **"Where was that conversation I forked?"** — fork history buried in jsonl files
-- **"Is my context window getting full?"** — no visibility without typing `/context`
+### Scattered instructions
+**Problem**: "Did I set up CLAUDE.md for this repo?" — configs spread across projects.
+**Solution**: Global + per-project CLAUDE.md tree view. Missing projects flagged with alerts. Line count warnings when over 200 lines.
 
-Claude Glean solves this by scanning `~/.claude/` and presenting everything in one dashboard.
+### Context blindness
+**Problem**: No idea how full the context window is until you type `/context` or it auto-compacts.
+**Solution**: Real-time token usage from `cache_read_input_tokens`. Breakdown by system, memory, agents, skills, messages. Recommendations for when to `/compact` or `/handoff`.
+
+### Lost conversations
+**Problem**: "Where was that fork I made last week?" — buried in jsonl files.
+**Solution**: All forks auto-labeled with the user's message at the branch point. Full session search. Click to copy `claude --resume --session-id <id>`.
+
+### Opaque configuration
+**Problem**: "What skills, agents, hooks, connectors do I even have? Which are mine vs plugin?"
+**Solution**: Everything listed with USER/PLUGIN badges. Click to expand full content. Delete button for user-created items.
+
+### Cleanup burden
+**Problem**: Old sessions, unused projects, test skills piling up in `~/.claude/`.
+**Solution**: Delete buttons for projects, sessions, forks, skills, agents, and hooks — right from the dashboard.
+
+### Gap analysis
+**Problem**: "Is my workspace properly set up? What am I missing?"
+**Solution**: Harness Score (0–100) checks 7 items. Alerts panel flags missing CLAUDE.md, high context usage, and configuration gaps.
 
 ## Features
 
-### Overview (Home)
+| Tab | What it shows |
+|-----|---------------|
+| **Overview** | Draggable card grid — sessions, alerts, instructions, projects, forks, plugins, skills, agents, connectors, hooks. Reorder to your preference. |
+| **Sessions** | Active sessions with Context X-ray. Session history with search. Click to copy resume command. Delete old sessions. |
+| **Instructions** | Global + per-project CLAUDE.md tree. Line counts, content viewer, warnings for bloated files. |
+| **Projects** | Per-project status — CLAUDE.md, memory files, settings, session count, first/latest prompt. Delete unused projects. |
+| **Forks** | Conversation branch points with auto-labels. Click to copy resume. Delete old forks. |
+| **Plugins** | Installed plugins with version, date, path. Click to see provided skills/agents/connectors. |
+| **Skills** | USER vs PLUGIN sections. Full SKILL.md content. Delete user skills. |
+| **Agents** | USER vs PLUGIN sections. Model, tools, full definition. Delete user agents. |
+| **Connectors** | Local + Cloud MCP servers. Tool list per server. Auto-detects cloud connectors (e.g., Atlassian) from session data. |
+| **Hooks** | USER vs PLUGIN sections. Event, type, command, matcher, timeout. Delete user hooks. |
 
-The Overview tab is a monitoring dashboard with draggable cards:
+## Real-time
 
-- **Active Sessions** — count of running Claude processes
-- **Today's Activity** — commands executed today
-- **Harness Score** — workspace setup completeness (0–100)
-- **Components** — count of skills, agents, hooks, connectors, plugins
-- **Sessions** — running sessions with name, project, status
-- **Alerts** — warnings for CLAUDE.md line count, missing instructions, context health
-- **Instructions** — global + per-project CLAUDE.md status with line counts
-- **Projects** — project summary with first/latest prompt
-- **Forks** — recent conversation branches with resume commands
-- **Plugins** — installed plugins with version and install date
-- **Skills / Agents / Connectors / Hooks** — quick preview of all configured items
-
-All overview cards are **draggable** — reorder them to your preference. Order is saved in localStorage.
-
-### Sessions Tab
-
-- **Active Sessions** — click to expand **Context X-ray**:
-  - Real token usage from `cache_read_input_tokens` (not estimation)
-  - Breakdown: System, Memory, Agents, Skills, Messages, Free space, Autocompact buffer
-  - Compact history and recommendations (`/compact`, `/handoff`)
-- **Search** — full-text search across all conversation history
-- **Session History** — all past sessions with slug name, project, message count, fork count
-- **Click to copy** `claude --resume --session-id <id>` for quick resume
-- **Delete** old sessions to clean up
-
-### Instructions Tab
-
-- **Global** section — `~/.claude/CLAUDE.md` with line count and content viewer
-- **Projects** section — grouped by project, showing all CLAUDE.md files in the tree
-  - Config CLAUDE.md (`~/.claude/projects/<path>/CLAUDE.md`)
-  - Local CLAUDE.md files (in repo subdirectories)
-  - Line count warnings (over 200 lines)
-  - Click project to expand, click "View content" to see file contents
-
-### Projects Tab
-
-Per-project management status:
-
-- CLAUDE.md presence (config + local)
-- Memory file count
-- Settings status
-- Session count
-- First prompt / Latest prompt
-- **Delete** unused projects
-
-### Forks Tab
-
-- All conversation fork points extracted from session jsonl files
-- Shows the user's message at each fork point as an auto-label
-- Click to copy resume command
-- **Delete** old fork sessions
-
-### Skills Tab
-
-- **USER** section — user-created skills with delete button
-- **PLUGIN** section — plugin-provided skills (no delete)
-- Click to expand full SKILL.md content
-
-### Agents Tab
-
-- **USER** section — user-created agents with model badge, delete button
-- **PLUGIN** section — plugin-provided agents with model/tools info
-- Click to expand full agent definition
-
-### Connectors Tab
-
-- **Local MCP servers** from `.mcp.json` files
-- **Cloud MCP servers** (e.g., Atlassian/Jira) detected from session tool usage
-- Tool count per server
-- Click to expand full tool list
-
-### Hooks Tab
-
-- **USER** section — hooks from `settings.json` with delete button
-- **PLUGIN** section — hooks from plugin `hooks/hooks.json` files
-- Shows event, type, command, matcher, timeout, and all configured fields
-- Click to expand full details
-
-### Plugins Tab
-
-- Installed plugins with version, install date, git SHA, install path
-- Click to expand associated skills, agents, and connectors
-- Active/Inactive status from `enabledPlugins`
+- Sessions update every 5 seconds via SSE
+- Alerts refresh every 30 seconds
+- Active tab preserved across page refreshes
 
 ## Network Access
-
-By default, the server binds to `0.0.0.0:8080`, accessible from other machines on the local network:
 
 ```
 http://<your-ip>:8080
 ```
+
+Accessible from any machine on the same network.
 
 ## License
 
