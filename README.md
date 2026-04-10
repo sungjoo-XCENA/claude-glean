@@ -114,10 +114,10 @@ If the directory exists with `settings.json`, `projects/`, `sessions/` inside, G
 ## Network Access
 
 ```
-http://<your-ip>:8080
+http://<your-ip>:<port>
 ```
 
-Accessible from any machine on the same network.
+Default port is `8080`. Accessible from any machine on the same network.
 
 ## License
 
