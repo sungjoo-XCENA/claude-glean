@@ -1,4 +1,4 @@
-# claude-glean
+# claude-gleaner
 
 A local dashboard that **gathers scattered Claude Code workspace data into one screen** — sessions, instructions, context usage, forks, skills, agents, connectors, hooks, plugins, and projects.
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Claude Glean — Claude Code workspace monitoring dashboard backend
+Claude Gleaner — Claude Code workspace monitoring dashboard backend
 Python 3.9+ / no external dependencies (stdlib only)
 """
 
@@ -21,7 +21,7 @@ from urllib.parse import urlparse, parse_qs
 # ─── Configuration ───────────────────────────────────────────────────────────
 import argparse
 
-_parser = argparse.ArgumentParser(description="Claude Glean — workspace dashboard")
+_parser = argparse.ArgumentParser(description="Claude Gleaner — workspace dashboard")
 _parser.add_argument("-p", "--port", type=int, default=8080, help="Port to bind (default: 8080)")
 _parser.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
 _args = _parser.parse_args()
@@ -194,7 +194,7 @@ def get_sessions() -> dict:
             continue
         # Exclude auxiliary processes (MCP servers, node, bash wrappers, etc.)
         if any(skip in cmd_lower for skip in [
-            "mcp-server", "server.py", "claude-glean", "node ", "bridge",
+            "mcp-server", "server.py", "claude-gleaner", "node ", "bridge",
             "/bin/bash", "cwd",
         ]):
             continue
@@ -1739,8 +1739,8 @@ API_ROUTES: dict[str, callable] = {
 }
 
 
-class GleanHandler(BaseHTTPRequestHandler):
-    """Claude Glean HTTP request handler."""
+class GleanerHandler(BaseHTTPRequestHandler):
+    """Claude Gleaner HTTP request handler."""
 
     # Simplify log output
     def log_message(self, format, *args):
@@ -2109,7 +2109,7 @@ class ThreadedHTTPServer(HTTPServer):
 
 
 def main():
-    server = ThreadedHTTPServer((BIND_HOST, BIND_PORT), GleanHandler)
+    server = ThreadedHTTPServer((BIND_HOST, BIND_PORT), GleanerHandler)
     print(f"Serving on http://{BIND_HOST}:{BIND_PORT}")
     print(f"→ Internal network: http://{INTERNAL_IP}:{BIND_PORT}")
     print(f"→ Static files: {DIST_DIR}")
