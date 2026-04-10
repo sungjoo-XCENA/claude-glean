@@ -4,6 +4,7 @@ Claude Glean — Claude Code workspace monitoring dashboard backend
 Python 3.9+ / no external dependencies (stdlib only)
 """
 
+import functools
 import json
 import mimetypes
 import os
@@ -23,18 +24,48 @@ import argparse
 
 _parser = argparse.ArgumentParser(description="Claude Glean — workspace dashboard")
 _parser.add_argument("-p", "--port", type=int, default=8080, help="Port to bind (default: 8080)")
-_parser.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
+_parser.add_argument("--host", default="127.0.0.1", help="Host to bind (default: 127.0.0.1)")
 _args = _parser.parse_args()
 
 BIND_HOST = _args.host
 BIND_PORT = _args.port
-INTERNAL_IP = socket.gethostbyname(socket.gethostname())
+try:
+    INTERNAL_IP = socket.gethostbyname(socket.gethostname())
+except socket.gaierror:
+    INTERNAL_IP = "127.0.0.1"
 
 CLAUDE_DIR = Path.home() / ".claude"
 CLAUDE_JSON = Path.home() / ".claude.json"
 DIST_DIR = Path(__file__).parent / "dist"
 
 SSE_INTERVAL = 5  # seconds
+
+# Input validation: only allow safe identifiers in user-supplied IDs
+SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+# ─── TTL Cache ───────────────────────────────────────────────────────────────
+
+_cache: dict[str, tuple[float, Any]] = {}
+_cache_lock = threading.Lock()
+
+
+def ttl_cache(ttl_seconds: float):
+    """Simple TTL-based cache decorator for expensive data-collection functions."""
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            key = fn.__name__
+            now = time.time()
+            with _cache_lock:
+                if key in _cache and now - _cache[key][0] < ttl_seconds:
+                    return _cache[key][1]
+            result = fn(*args, **kwargs)
+            with _cache_lock:
+                _cache[key] = (now, result)
+            return result
+        return wrapper
+    return decorator
 
 
 # ─── Utilities ───────────────────────────────────────────────────────────────
@@ -52,10 +83,12 @@ def read_text(path: Path, max_chars: int = 0) -> Optional[str]:
     """Safely read a text file. Truncates if max_chars > 0."""
     try:
         with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-        if max_chars > 0 and len(content) > max_chars:
-            return content[:max_chars]
-        return content
+            if max_chars > 0:
+                content = f.read(max_chars + 1)
+                if len(content) > max_chars:
+                    return content[:max_chars]
+                return content
+            return f.read()
     except (FileNotFoundError, PermissionError, UnicodeDecodeError):
         return None
 
@@ -83,6 +116,7 @@ def parse_frontmatter(text: str) -> dict:
     return result
 
 
+@functools.lru_cache(maxsize=256)
 def decode_project_path(folder_name: str) -> str:
     """Convert a project folder name to its actual path. '-home-sungjoo-repo' → '/home/sungjoo/repo'
 
@@ -120,6 +154,7 @@ def decode_project_path(folder_name: str) -> str:
 
 # ─── Data Collection Functions ──────────────────────────────────────────────
 
+@ttl_cache(ttl_seconds=10)
 def get_health() -> dict:
     """Harness health score (0-100), checks 7 items."""
     items = {}
@@ -161,6 +196,7 @@ def get_health() -> dict:
     return {"score": score, "total": total, "items": items}
 
 
+@ttl_cache(ttl_seconds=5)
 def get_sessions() -> dict:
     """List of active claude processes for the current user."""
     sessions = []
@@ -209,12 +245,22 @@ def get_sessions() -> dict:
         else:
             state = "active"  # S, Sl+, etc.
 
-        # Get cwd
+        # Get cwd — macOS has no /proc, use lsof as fallback
         cwd = ""
         try:
             cwd = os.readlink(f"/proc/{pid}/cwd")
         except (FileNotFoundError, PermissionError, OSError):
-            pass
+            try:
+                lsof = subprocess.run(
+                    ["lsof", "-a", "-d", "cwd", "-Fn", "-p", str(pid)],
+                    capture_output=True, text=True, timeout=3,
+                )
+                for lsof_line in lsof.stdout.splitlines():
+                    if lsof_line.startswith("n"):
+                        cwd = lsof_line[1:]
+                        break
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                pass
 
         sessions.append({
             "pid": pid,
@@ -228,6 +274,7 @@ def get_sessions() -> dict:
     return {"sessions": sessions}
 
 
+@ttl_cache(ttl_seconds=5)
 def get_activity() -> dict:
     """Today's command count + recent activity summary from history.jsonl."""
     history_path = CLAUDE_DIR / "history.jsonl"
@@ -240,13 +287,13 @@ def get_activity() -> dict:
     today_count = 0
     recent = []
 
-    try:
-        text = read_text(history_path)
-        if not text:
-            return {"today_count": 0, "recent": []}
-        lines = text.splitlines()
+    # Read last 5000 lines instead of entire file
+    lines = _read_last_n_lines(history_path, 5000)
+    if not lines:
+        return {"today_count": 0, "recent": []}
 
-        # Today's command count (full scan)
+    try:
+        # Today's command count from recent lines
         for line in lines:
             try:
                 entry = json.loads(line)
@@ -293,12 +340,12 @@ def get_projects_summary() -> dict:
         return {"projects": []}
 
     by_project: dict = {}
-    try:
-        text = read_text(history_path)
-        if not text:
-            return {"projects": []}
+    lines = _read_last_n_lines(history_path, 5000)
+    if not lines:
+        return {"projects": []}
 
-        for line in text.splitlines()[-5000:]:
+    try:
+        for line in lines:
             try:
                 entry = json.loads(line)
             except Exception:
@@ -447,6 +494,7 @@ def get_instructions() -> dict:
     return result
 
 
+@ttl_cache(ttl_seconds=30)
 def get_skills() -> dict:
     """Skill scan: ~/.claude/skills/ + skills/ inside plugin cache."""
     skills = []
@@ -499,6 +547,7 @@ def get_skills() -> dict:
     return {"skills": skills}
 
 
+@ttl_cache(ttl_seconds=30)
 def get_agents() -> dict:
     """Agent scan: ~/.claude/agents/ + agents/ inside plugin cache."""
     agents = []
@@ -548,6 +597,7 @@ def get_agents() -> dict:
     return {"agents": agents}
 
 
+@ttl_cache(ttl_seconds=30)
 def get_connectors() -> dict:
     """MCP server scan: ~/.claude.json + .mcp.json in plugins + extract cloud MCP from session JSONL."""
     connectors = []
@@ -729,6 +779,7 @@ def get_connectors() -> dict:
     return {"connectors": connectors}
 
 
+@ttl_cache(ttl_seconds=10)
 def get_hooks() -> dict:
     """~/.claude/settings.json → hooks."""
     hooks_list = []
@@ -741,14 +792,14 @@ def get_hooks() -> dict:
         for event, handlers in hooks.items():
             if not isinstance(handlers, list):
                 handlers = [handlers]
-            for h in handlers:
+            for h_idx, h in enumerate(handlers):
                 if not isinstance(h, dict):
                     continue
                 matcher = h.get("matcher", "")
                 # New structure: {"matcher": "...", "hooks": [{...}]}
                 sub_hooks = h.get("hooks", [])
                 if isinstance(sub_hooks, list) and sub_hooks:
-                    for sh in sub_hooks:
+                    for sh_idx, sh in enumerate(sub_hooks):
                         if isinstance(sh, dict):
                             entry = {
                                 "event": event,
@@ -766,9 +817,13 @@ def get_hooks() -> dict:
                                 "asyncRewake": sh.get("asyncRewake", False),
                                 "if": sh.get("if", ""),
                                 "shell": sh.get("shell", ""),
+                                # Position metadata for correct deletion
+                                "handler_index": h_idx,
+                                "sub_hook_index": sh_idx,
                             }
-                            # Remove empty values
-                            entry = {k: v for k, v in entry.items() if v}
+                            # Remove None and empty string, but keep 0, False, []
+                            entry = {k: v for k, v in entry.items()
+                                     if v is not None and v != ""}
                             entry.setdefault("event", event)
                             entry.setdefault("type", "command")
                             hooks_list.append(entry)
@@ -781,6 +836,7 @@ def get_hooks() -> dict:
                         "command": h["command"],
                         "description": h.get("description", ""),
                         "timeout": h.get("timeout"),
+                        "handler_index": h_idx,
                     })
 
     # Add source tag to user hooks
@@ -827,7 +883,8 @@ def get_hooks() -> dict:
                                     "timeout": sh.get("timeout"),
                                     "source": f"plugin:{plugin_name}",
                                 }
-                                entry = {k: v for k, v in entry.items() if v}
+                                entry = {k: v for k, v in entry.items()
+                                         if v is not None and v != ""}
                                 entry.setdefault("event", event)
                                 entry.setdefault("type", "command")
                                 entry.setdefault("source", f"plugin:{plugin_name}")
@@ -855,12 +912,9 @@ def get_forks() -> dict:
                 continue
 
             try:
-                text = read_text(jsonl_file)
-                if not text:
+                lines = _read_last_n_lines(jsonl_file, 3000)
+                if not lines:
                     continue
-                lines = text.splitlines()
-                # Process only last 3000 lines
-                lines = lines[-3000:]
 
                 # Build parent→children map
                 parent_to_children: dict[str, list[dict]] = {}
@@ -910,7 +964,7 @@ def get_forks() -> dict:
                             continue
 
                         display_text = msg_text[:100]
-                        dedup_key = msg_text[:50]
+                        dedup_key = msg_text[:200]
                         if dedup_key in seen_texts:
                             continue
                         seen_texts.add(dedup_key)
@@ -1024,6 +1078,11 @@ def get_plugins() -> dict:
         elif isinstance(ep, list):
             enabled_plugins = {name: True for name in ep}
 
+    # Pre-fetch once (cached via @ttl_cache) — not per-plugin
+    all_skills = get_skills()["skills"]
+    all_agents = get_agents()["agents"]
+    all_connectors = get_connectors()["connectors"]
+
     for plugin_key, entries in plugins_map.items():
         # entries is a list of install info
         if isinstance(entries, list) and entries:
@@ -1033,9 +1092,9 @@ def get_plugins() -> dict:
                 name = plugin_key.split("@")[0] if "@" in plugin_key else plugin_key
                 # Count skills/agents/connectors belonging to this plugin
                 plugin_source = f"plugin:{name}"
-                n_skills = len([s for s in get_skills()["skills"] if s.get("source") == plugin_source])
-                n_agents = len([a for a in get_agents()["agents"] if a.get("source") == plugin_source])
-                n_connectors = len([c for c in get_connectors()["connectors"] if c.get("source") == plugin_source])
+                n_skills = len([s for s in all_skills if s.get("source") == plugin_source])
+                n_agents = len([a for a in all_agents if a.get("source") == plugin_source])
+                n_connectors = len([c for c in all_connectors if c.get("source") == plugin_source])
 
                 plugins.append({
                     "name": name,
@@ -1064,11 +1123,15 @@ def _read_last_n_lines(path: Path, n: int) -> list[str]:
             fsize = f.tell()
             if fsize == 0:
                 return []
-            # JSONL lines can be several KB each, so read generously
-            read_size = min(fsize, n * 5000)
-            f.seek(max(0, fsize - read_size))
+            # JSONL lines can be 50-100KB (tool results, code), read generously
+            read_size = min(fsize, n * 50_000)
+            offset = max(0, fsize - read_size)
+            f.seek(offset)
             data = f.read().decode("utf-8", errors="replace")
             lines = data.splitlines()
+            # If we didn't read from the start, first line is likely partial — discard it
+            if offset > 0 and lines:
+                lines = lines[1:]
             return lines[-n:] if len(lines) > n else lines
     except (FileNotFoundError, PermissionError, OSError):
         return []
@@ -1148,12 +1211,19 @@ def get_session_detail() -> dict:
                 decoded_path = decode_project_path(proj_dir.name)
                 project_name = Path(decoded_path).name or proj_dir.name
 
-                # Extract slug from last 5 lines
-                last_5 = _read_last_n_lines(jsonl_file, 5)
+                # Single-pass: read first 20 + last 1000 lines (2 file opens instead of 5-6)
+                first_20 = _read_first_n_lines(jsonl_file, 20)
+                last_1000 = _read_last_n_lines(jsonl_file, 1000)
+
+                # Extract slug, last_timestamp, customTitle from tail
                 slug = ""
                 last_timestamp = ""
                 custom_title = ""
-                for line in reversed(last_5):
+                message_count = 0
+                last_message = ""
+                parent_children: dict[str, int] = {}
+
+                for line in reversed(last_1000[-5:]):
                     try:
                         entry = json.loads(line)
                         if not slug and entry.get("slug"):
@@ -1162,34 +1232,36 @@ def get_session_detail() -> dict:
                             last_timestamp = entry["timestamp"]
                     except Exception:
                         continue
-                # customTitle only exists in type:"custom-title" entries — find via grep
-                if not custom_title:
-                    try:
-                        result = subprocess.run(
-                            ["grep", "-o", '"customTitle":"[^"]*"', str(jsonl_file)],
-                            capture_output=True, text=True, timeout=3
-                        )
-                        if result.stdout.strip():
-                            last_match = result.stdout.strip().splitlines()[-1]
-                            custom_title = last_match.split(':"')[1].rstrip('"')
-                    except Exception:
-                        pass
-                slug = custom_title or slug
 
-                # Estimate message count (sample last 500 lines)
-                last_500 = _read_last_n_lines(jsonl_file, 500)
-                message_count = 0
-                for line in last_500:
+                # Single pass over last 1000 lines: count messages, find customTitle,
+                # last user message, fork parents
+                for line in last_1000:
                     try:
                         entry = json.loads(line)
-                        t = entry.get("type", "")
-                        if t in ("user", "assistant"):
-                            message_count += 1
                     except Exception:
                         continue
+                    t = entry.get("type", "")
+                    if t in ("user", "assistant"):
+                        message_count += 1
+                    if t == "user":
+                        text = _extract_user_message_text(entry)
+                        if text and len(text) >= 3 and not text.startswith("{"):
+                            last_message = text[:120]
+                    if not custom_title and entry.get("customTitle"):
+                        custom_title = entry["customTitle"]
+                    # Also search for customTitle in raw line (some entries embed it differently)
+                    if not custom_title and '"customTitle"' in line:
+                        m = re.search(r'"customTitle"\s*:\s*"([^"]*)"', line)
+                        if m:
+                            custom_title = m.group(1)
+                    parent_uuid = entry.get("parentUuid")
+                    if parent_uuid:
+                        parent_children[parent_uuid] = parent_children.get(parent_uuid, 0) + 1
 
-                # First user message (first 20 lines)
-                first_20 = _read_first_n_lines(jsonl_file, 20)
+                slug = custom_title or slug
+                fork_count = sum(1 for c in parent_children.values() if c > 1)
+
+                # First user message from head
                 first_message = ""
                 for line in first_20:
                     try:
@@ -1201,33 +1273,6 @@ def get_session_detail() -> dict:
                     except Exception:
                         continue
 
-                # Last user message (last 20 lines)
-                last_20 = _read_last_n_lines(jsonl_file, 20)
-                last_message = ""
-                for line in reversed(last_20):
-                    try:
-                        entry = json.loads(line)
-                        text = _extract_user_message_text(entry)
-                        if text and len(text) >= 3 and not text.startswith("{"):
-                            last_message = text[:120]
-                            break
-                    except Exception:
-                        continue
-
-                # Fork count (sample last 1000 lines)
-                last_1000 = _read_last_n_lines(jsonl_file, 1000)
-                parent_children: dict[str, int] = {}
-                for line in last_1000:
-                    try:
-                        entry = json.loads(line)
-                        parent_uuid = entry.get("parentUuid")
-                        if parent_uuid:
-                            parent_children[parent_uuid] = parent_children.get(parent_uuid, 0) + 1
-                    except Exception:
-                        continue
-                fork_count = sum(1 for c in parent_children.values() if c > 1)
-
-                # Check if active (session ID is in active session list)
                 is_active = session_id in active_session_ids
 
                 sessions.append({
@@ -1247,7 +1292,18 @@ def get_session_detail() -> dict:
                 continue
 
     # Sort: active first, then last_timestamp descending
-    sessions.sort(key=lambda x: (not x["is_active"], -(x.get("last_timestamp") or 0) if isinstance(x.get("last_timestamp"), (int,float)) else x.get("last_timestamp", "") or ""), reverse=False)
+    def _normalize_ts(ts) -> float:
+        """Normalize timestamp to float for consistent sorting."""
+        if isinstance(ts, (int, float)):
+            return float(ts)
+        if isinstance(ts, str) and ts:
+            try:
+                return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000
+            except (ValueError, TypeError):
+                return 0.0
+        return 0.0
+
+    sessions.sort(key=lambda x: (not x["is_active"], -_normalize_ts(x.get("last_timestamp"))))
 
     return {"sessions": sessions}
 
@@ -1326,19 +1382,19 @@ def get_session_xray(session_id: str) -> dict:
     messages_since_compact = 0
     found_compact = False
 
-    # First pass: count all compacts (need full file for total count)
-    # Read entire file just for compact counting (type=="summary" lines are rare and small)
+    # Stream compact counting — don't load entire file into memory
     try:
-        with open(jsonl_path, "rb") as f:
-            raw = f.read().decode("utf-8", errors="replace")
-        for raw_line in raw.splitlines():
-            try:
-                entry = json.loads(raw_line)
-            except Exception:
-                continue
-            if entry.get("type") == "summary":
-                compacts_total += 1
-                last_compact_timestamp = entry.get("timestamp")
+        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                if '"summary"' not in raw_line:
+                    continue
+                try:
+                    entry = json.loads(raw_line)
+                except Exception:
+                    continue
+                if entry.get("type") == "summary":
+                    compacts_total += 1
+                    last_compact_timestamp = entry.get("timestamp")
     except (FileNotFoundError, PermissionError, OSError):
         pass
 
@@ -1457,33 +1513,24 @@ def get_session_search(query: str = "") -> dict:
                 decoded_path = decode_project_path(proj_dir.name)
                 project_name = Path(decoded_path).name or proj_dir.name
 
-                # Extract slug/customTitle
-                last_5 = _read_last_n_lines(jsonl_file, 5)
+                # Read last 2000 lines once, extract slug/customTitle inline
+                lines = _read_last_n_lines(jsonl_file, 2000)
                 slug = ""
                 custom_title = ""
-                for line in reversed(last_5):
+                for line in reversed(lines[-5:]):
                     try:
                         entry = json.loads(line)
                         if not slug and entry.get("slug"):
                             slug = entry["slug"]
                     except Exception:
                         continue
-                # customTitle only exists in type:"custom-title" entries — find via grep
-                if not custom_title:
-                    try:
-                        result = subprocess.run(
-                            ["grep", "-o", '"customTitle":"[^"]*"', str(jsonl_file)],
-                            capture_output=True, text=True, timeout=3
-                        )
-                        if result.stdout.strip():
-                            last_match = result.stdout.strip().splitlines()[-1]
-                            custom_title = last_match.split(':"')[1].rstrip('"')
-                    except Exception:
-                        pass
+                # Search for customTitle in the lines (no subprocess)
+                for line in lines:
+                    if '"customTitle"' in line:
+                        m = re.search(r'"customTitle"\s*:\s*"([^"]*)"', line)
+                        if m:
+                            custom_title = m.group(1)
                 slug = custom_title or slug
-
-                # Search last 2000 lines
-                lines = _read_last_n_lines(jsonl_file, 2000)
                 for line in reversed(lines):
                     try:
                         entry = json.loads(line)
@@ -1634,35 +1681,31 @@ def get_alerts() -> dict:
                 if session_id not in active_session_ids:
                     continue
 
-                # Extract slug/customTitle
-                last_5 = _read_last_n_lines(jsonl_file, 5)
+                # Single read: last 20 lines for slug + token usage
+                last_20 = _read_last_n_lines(jsonl_file, 20)
                 slug = ""
                 custom_title = ""
-                for line in reversed(last_5):
+                for line in reversed(last_20[-5:]):
                     try:
                         entry = json.loads(line)
                         if not slug and entry.get("slug"):
                             slug = entry["slug"]
+                        if not custom_title and entry.get("customTitle"):
+                            custom_title = entry["customTitle"]
                     except Exception:
                         continue
+                # Search for customTitle in all 20 lines (no subprocess)
                 if not custom_title:
-                    try:
-                        result = subprocess.run(
-                            ["grep", "-o", '"customTitle":"[^"]*"', str(jsonl_file)],
-                            capture_output=True, text=True, timeout=3
-                        )
-                        if result.stdout.strip():
-                            last_match = result.stdout.strip().splitlines()[-1]
-                            custom_title = last_match.split(':"')[1].rstrip('"')
-                    except Exception:
-                        pass
+                    for line in last_20:
+                        if '"customTitle"' in line:
+                            m = re.search(r'"customTitle"\s*:\s*"([^"]*)"', line)
+                            if m:
+                                custom_title = m.group(1)
+                                break
                 slug = custom_title or slug
                 project_path = decode_project_path(proj_dir.name)
                 project_name = Path(project_path).name or proj_dir.name
                 display_name = (slug or session_id[:16]) + f" ({project_name})"
-
-                # Extract actual token usage from last 20 lines
-                last_20 = _read_last_n_lines(jsonl_file, 20)
                 token_data = _extract_token_usage(last_20)
                 context_tokens = token_data.get("context_tokens", 0)
                 context_pct = round(context_tokens / 1_000_000 * 100) if context_tokens > 0 else 0
@@ -1777,118 +1820,165 @@ class GleanHandler(BaseHTTPRequestHandler):
         # Serve static files
         self._serve_static(path)
 
+    def _check_origin(self) -> bool:
+        """Validate Origin header on mutating requests. Reject cross-origin."""
+        origin = self.headers.get("Origin", "")
+        if not origin:
+            return True  # Same-origin requests (non-browser or same-page) omit Origin
+        # Allow requests from the dashboard itself
+        allowed = {
+            f"http://localhost:{BIND_PORT}",
+            f"http://127.0.0.1:{BIND_PORT}",
+            f"http://{INTERNAL_IP}:{BIND_PORT}",
+        }
+        return origin in allowed
+
     def do_POST(self):
+        if not self._check_origin():
+            self._json_response({"error": "origin not allowed"}, 403, allow_cors=False)
+            return
+
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         query_params = parse_qs(parsed.query)
 
         if path == "/api/delete-project":
-            dir_name = query_params.get("dir", [""])[0]
-            if not dir_name:
-                self._json_response({"error": "dir parameter required"}, 400)
-                return
-            # Safety check: only allow deletion of folders inside projects directory
-            target = CLAUDE_DIR / "projects" / dir_name
-            if not target.is_dir() or ".." in dir_name:
-                self._json_response({"error": "invalid project directory"}, 400)
-                return
             import shutil
+            dir_name = query_params.get("dir", [""])[0]
+            if not dir_name or not SAFE_ID_RE.match(dir_name.replace("-", "")):
+                self._json_response({"error": "dir parameter required"}, 400, allow_cors=False)
+                return
+            target = CLAUDE_DIR / "projects" / dir_name
+            # resolve() + prefix check to prevent symlink traversal
+            projects_resolved = (CLAUDE_DIR / "projects").resolve()
+            try:
+                target_resolved = target.resolve()
+                if not str(target_resolved).startswith(str(projects_resolved) + "/"):
+                    self._json_response({"error": "invalid project directory"}, 400, allow_cors=False)
+                    return
+            except (ValueError, OSError):
+                self._json_response({"error": "invalid project directory"}, 400, allow_cors=False)
+                return
+            if not target.is_dir():
+                self._json_response({"error": "invalid project directory"}, 400, allow_cors=False)
+                return
             try:
                 shutil.rmtree(target)
-                self._json_response({"ok": True, "deleted": dir_name})
-            except Exception as e:
-                self._json_response({"error": str(e)}, 500)
+                self._json_response({"ok": True, "deleted": dir_name}, allow_cors=False)
+            except Exception:
+                self._json_response({"error": "failed to delete project"}, 500, allow_cors=False)
             return
 
         if path == "/api/delete-skill":
             import shutil
             skill_name = query_params.get("name", [""])[0]
-            if not skill_name or ".." in skill_name:
-                self._json_response({"error": "name parameter required"}, 400)
+            if not skill_name or not SAFE_ID_RE.match(skill_name):
+                self._json_response({"error": "name parameter required"}, 400, allow_cors=False)
                 return
-            # User skills only: ~/.claude/skills/{name}/
             target = CLAUDE_DIR / "skills" / skill_name
             plugin_cache = CLAUDE_DIR / "plugins" / "cache"
-            # Verify target is NOT inside plugin cache
+            skills_resolved = (CLAUDE_DIR / "skills").resolve()
             try:
-                target.resolve().relative_to(plugin_cache.resolve())
-                self._json_response({"error": "cannot delete plugin skills"}, 403)
+                target_resolved = target.resolve()
+                if not str(target_resolved).startswith(str(skills_resolved) + "/"):
+                    self._json_response({"error": "invalid skill"}, 400, allow_cors=False)
+                    return
+                target_resolved.relative_to(plugin_cache.resolve())
+                self._json_response({"error": "cannot delete plugin skills"}, 403, allow_cors=False)
                 return
             except ValueError:
                 pass  # Not in plugin cache — OK
             if not target.is_dir():
-                self._json_response({"error": "skill not found"}, 404)
+                self._json_response({"error": "skill not found"}, 404, allow_cors=False)
                 return
             try:
                 shutil.rmtree(target)
-                self._json_response({"ok": True})
-            except Exception as e:
-                self._json_response({"error": str(e)}, 500)
+                self._json_response({"ok": True}, allow_cors=False)
+            except Exception:
+                self._json_response({"error": "failed to delete skill"}, 500, allow_cors=False)
             return
 
         if path == "/api/delete-agent":
             agent_name = query_params.get("name", [""])[0]
-            if not agent_name or ".." in agent_name:
-                self._json_response({"error": "name parameter required"}, 400)
+            if not agent_name or not SAFE_ID_RE.match(agent_name):
+                self._json_response({"error": "name parameter required"}, 400, allow_cors=False)
                 return
-            # User agents only: ~/.claude/agents/{name}.md
             target = CLAUDE_DIR / "agents" / (agent_name + ".md")
             plugin_cache = CLAUDE_DIR / "plugins" / "cache"
-            # Verify target is NOT inside plugin cache
+            agents_resolved = (CLAUDE_DIR / "agents").resolve()
             try:
-                target.resolve().relative_to(plugin_cache.resolve())
-                self._json_response({"error": "cannot delete plugin agents"}, 403)
+                target_resolved = target.resolve()
+                if not str(target_resolved).startswith(str(agents_resolved) + "/"):
+                    self._json_response({"error": "invalid agent"}, 400, allow_cors=False)
+                    return
+                target_resolved.relative_to(plugin_cache.resolve())
+                self._json_response({"error": "cannot delete plugin agents"}, 403, allow_cors=False)
                 return
             except ValueError:
                 pass  # Not in plugin cache — OK
             if not target.is_file():
-                self._json_response({"error": "agent not found"}, 404)
+                self._json_response({"error": "agent not found"}, 404, allow_cors=False)
                 return
             try:
                 target.unlink()
-                self._json_response({"ok": True})
-            except Exception as e:
-                self._json_response({"error": str(e)}, 500)
+                self._json_response({"ok": True}, allow_cors=False)
+            except Exception:
+                self._json_response({"error": "failed to delete agent"}, 500, allow_cors=False)
             return
 
         if path == "/api/delete-hook":
             event = query_params.get("event", [""])[0]
-            index = query_params.get("index", ["0"])[0]
+            handler_index = query_params.get("handler_index", [""])[0]
+            sub_hook_index = query_params.get("sub_hook_index", [""])[0]
             if not event:
-                self._json_response({"error": "event parameter required"}, 400)
+                self._json_response({"error": "event parameter required"}, 400, allow_cors=False)
                 return
             try:
-                idx = int(index)
+                h_idx = int(handler_index)
+                sh_idx = int(sub_hook_index) if sub_hook_index else -1
             except ValueError:
-                self._json_response({"error": "invalid index"}, 400)
+                self._json_response({"error": "invalid index"}, 400, allow_cors=False)
                 return
             settings_path = CLAUDE_DIR / "settings.json"
             try:
                 settings = json.loads(settings_path.read_text(encoding="utf-8"))
                 hooks = settings.get("hooks", {})
                 if event not in hooks:
-                    self._json_response({"error": f"event {event} not found"}, 404)
+                    self._json_response({"error": "event not found"}, 404, allow_cors=False)
                     return
                 handlers = hooks[event]
-                if not isinstance(handlers, list) or idx >= len(handlers):
-                    self._json_response({"error": "invalid index"}, 400)
+                if not isinstance(handlers, list) or h_idx >= len(handlers):
+                    self._json_response({"error": "invalid handler index"}, 400, allow_cors=False)
                     return
-                handlers.pop(idx)
+                handler = handlers[h_idx]
+                sub_hooks = handler.get("hooks", []) if isinstance(handler, dict) else []
+                if sh_idx >= 0 and isinstance(sub_hooks, list) and sub_hooks:
+                    # Delete specific sub-hook within the handler
+                    if sh_idx >= len(sub_hooks):
+                        self._json_response({"error": "invalid sub_hook index"}, 400, allow_cors=False)
+                        return
+                    sub_hooks.pop(sh_idx)
+                    if not sub_hooks:
+                        # No sub-hooks left, remove entire handler
+                        handlers.pop(h_idx)
+                else:
+                    # Old-style handler or no sub-hook specified: remove entire handler
+                    handlers.pop(h_idx)
                 if not handlers:
                     del hooks[event]
                 if not hooks:
                     del settings["hooks"]
                 settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
-                self._json_response({"ok": True})
-            except Exception as e:
-                self._json_response({"error": str(e)}, 500)
+                self._json_response({"ok": True}, allow_cors=False)
+            except Exception:
+                self._json_response({"error": "failed to delete hook"}, 500, allow_cors=False)
             return
 
         if path in ("/api/delete-session", "/api/delete-fork"):
             import shutil
             session_id = query_params.get("id", [""])[0]
-            if not session_id or ".." in session_id or "/" in session_id:
-                self._json_response({"error": "id parameter required"}, 400)
+            if not session_id or not SAFE_ID_RE.match(session_id):
+                self._json_response({"error": "id parameter required"}, 400, allow_cors=False)
                 return
             # Check against active sessions
             active_session_ids = set()
@@ -1919,27 +2009,31 @@ class GleanHandler(BaseHTTPRequestHandler):
                     except ValueError:
                         pass
             if session_id in active_session_ids:
-                self._json_response({"error": "cannot delete active session"}, 400)
+                self._json_response({"error": "cannot delete active session"}, 400, allow_cors=False)
                 return
             deleted_anything = False
-            errors = []
-            # Delete JSONL file(s) across all project dirs
+            # Use exact file match instead of rglob to prevent glob injection
             projects_dir = CLAUDE_DIR / "projects"
             if projects_dir.is_dir():
-                for jsonl_file in projects_dir.rglob(f"{session_id}.jsonl"):
-                    try:
-                        jsonl_file.unlink()
-                        deleted_anything = True
-                    except Exception as e:
-                        errors.append(str(e))
-                # Delete subagent directory if exists
-                for subdir in projects_dir.rglob(session_id):
+                for proj_dir in projects_dir.iterdir():
+                    if not proj_dir.is_dir():
+                        continue
+                    # Exact file match — no glob characters
+                    jsonl_file = proj_dir / f"{session_id}.jsonl"
+                    if jsonl_file.is_file():
+                        try:
+                            jsonl_file.unlink()
+                            deleted_anything = True
+                        except Exception:
+                            pass
+                    # Exact subagent directory match
+                    subdir = proj_dir / session_id
                     if subdir.is_dir():
                         try:
                             shutil.rmtree(subdir)
                             deleted_anything = True
-                        except Exception as e:
-                            errors.append(str(e))
+                        except Exception:
+                            pass
             # Remove sessions/*.json where sessionId matches
             if sessions_dir.is_dir():
                 for sf in sessions_dir.glob("*.json"):
@@ -1948,23 +2042,24 @@ class GleanHandler(BaseHTTPRequestHandler):
                         if sess_data and sess_data.get("sessionId", "") == session_id:
                             sf.unlink()
                             deleted_anything = True
-                    except Exception as e:
-                        errors.append(str(e))
-            if errors:
-                self._json_response({"error": "; ".join(errors)}, 500)
+                    except Exception:
+                        pass
+            if not deleted_anything:
+                self._json_response({"error": "session not found"}, 404, allow_cors=False)
                 return
-            self._json_response({"ok": True})
+            self._json_response({"ok": True}, allow_cors=False)
             return
 
         self._json_response({"error": "not found"}, 404)
 
-    def _json_response(self, data: Any, status: int = 200):
+    def _json_response(self, data: Any, status: int = 200, allow_cors: bool = True):
         """Send JSON response."""
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if allow_cors:
+            self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 

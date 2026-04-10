@@ -14,15 +14,15 @@ python3 server.py
 
 Open `http://localhost:8080`. That's it.
 
-Custom port:
+Custom port / network access:
 
 ```bash
-python3 server.py -p 3000        # port 3000
-python3 server.py --host 127.0.0.1  # localhost only
+python3 server.py -p 3000           # port 3000
+python3 server.py --host 0.0.0.0    # expose to LAN
 ```
 
 - Python 3.9+ (stdlib only, zero dependencies)
-- Default: `0.0.0.0:8080` — accessible from other machines via `http://<your-ip>:8080`
+- Default: `127.0.0.1:8080` (localhost only). Use `--host 0.0.0.0` to expose to the local network.
 
 ## What It Solves
 
@@ -77,11 +77,13 @@ python3 server.py --host 127.0.0.1  # localhost only
 
 ## Network Access
 
-```
-http://<your-ip>:8080
+By default, the server binds to `127.0.0.1` (localhost only). To expose on the local network:
+
+```bash
+python3 server.py --host 0.0.0.0
 ```
 
-Accessible from any machine on the same network.
+Then access via `http://<your-ip>:8080` from other machines.
 
 ## License
 
