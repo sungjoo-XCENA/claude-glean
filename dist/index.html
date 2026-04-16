@@ -2768,7 +2768,7 @@ async function renderBurnSummary() {
     const t = today.overview;
     const w = week.overview;
     // Daily trend (last 7 days)
-    const daily = (week.daily || []).slice(-7);
+    const daily = (week.daily || []).slice().sort(function(a,b){ return (b.date||'').localeCompare(a.date||''); }).slice(0, 7);
     const maxD = Math.max(...daily.map(d => d.costUSD), 0.01);
     const dailyBars = daily.map(d => {
       const pct = Math.max(Math.round((d.costUSD / maxD) * 100), 2);
@@ -2885,7 +2885,7 @@ function burnBarRows(items, opts) {
     return '<div class="burn-bar-row">' +
       colorDot +
       '<span class="burn-bar-name" title="' + esc(name) + '">' + esc(name) + '</span>' +
-      '<div class="burn-bar" style="max-width:' + barWidth + 'px"><div class="burn-bar-fill" style="width:' + pct.toFixed(1) + '%;' + barGrad + '"></div></div>' +
+      '<div class="burn-bar"><div class="burn-bar-fill" style="width:' + pct.toFixed(1) + '%;' + barGrad + '"></div></div>' +
       '<div class="burn-bar-values">' + extras + '</div>' +
       '</div>';
   }).join('');
@@ -2937,7 +2937,7 @@ function renderBurn() {
     '<div class="burn-panel-title" style="color:#14b8a6">Daily Activity</div>' +
     '<div class="burn-panel-cols"><span>Date</span><span>Cost / Calls</span></div>' +
     burnBarRows(
-      daily.slice().sort(function(a,b){ return (a.date||'').localeCompare(b.date||''); }),
+      daily.slice().sort(function(a,b){ return (b.date||'').localeCompare(a.date||''); }),
       { nameKey: 'date', valueKey: 'costUSD', barColor: ['#0d3d38','#14b8a6'], extraCols: [
         { key: 'costUSD', format: function(v){ return formatCost(v); }, primary: true },
         { key: 'calls', format: function(v){ return esc(String(v || 0)); } }

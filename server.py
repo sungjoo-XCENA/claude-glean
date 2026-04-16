@@ -8,8 +8,10 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
@@ -35,6 +37,122 @@ CLAUDE_JSON = Path.home() / ".claude.json"
 DIST_DIR = Path(__file__).parent / "dist"
 
 SSE_INTERVAL = 5  # seconds
+
+
+# ─── Docker Session Scanning ─────────────────────────────────────────────────
+
+_DOCKER_CACHE_DIR = Path(tempfile.gettempdir()) / "gleaner-docker-sessions"
+_DOCKER_CACHE_TTL = 30  # seconds
+_docker_cache_ts: float = 0.0
+_docker_container_info: dict = {}  # container_id -> {"name": ..., "projects_path": ...}
+
+
+def _sync_docker_sessions() -> Path:
+    """Sync ~/.claude/projects from running Docker containers to a local temp dir.
+    Returns the cache directory path. Uses TTL-based caching."""
+    global _docker_cache_ts, _docker_container_info
+
+    now = time.time()
+    if now - _docker_cache_ts < _DOCKER_CACHE_TTL and _DOCKER_CACHE_DIR.is_dir():
+        return _DOCKER_CACHE_DIR
+
+    # Check if docker is available
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-q"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return _DOCKER_CACHE_DIR
+        container_ids = [cid.strip() for cid in result.stdout.splitlines() if cid.strip()]
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return _DOCKER_CACHE_DIR
+
+    if not container_ids:
+        _docker_cache_ts = now
+        return _DOCKER_CACHE_DIR
+
+    _DOCKER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _docker_container_info = {}
+
+    for cid in container_ids:
+        short_id = cid[:12]
+
+        # Get container name
+        try:
+            name_result = subprocess.run(
+                ["docker", "inspect", "--format", "{{.Name}}", cid],
+                capture_output=True, text=True, timeout=5
+            )
+            container_name = name_result.stdout.strip().lstrip("/") if name_result.returncode == 0 else short_id
+        except Exception:
+            container_name = short_id
+
+        # Try common paths for .claude/projects inside the container
+        claude_paths = ["/root/.claude/projects", "/home/*/.claude/projects"]
+        found_path = None
+
+        for path_pattern in claude_paths:
+            try:
+                # For wildcard, use shell expansion inside container
+                if "*" in path_pattern:
+                    check = subprocess.run(
+                        ["docker", "exec", cid, "sh", "-c", f"ls -d {path_pattern} 2>/dev/null | head -1"],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if check.returncode == 0 and check.stdout.strip():
+                        found_path = check.stdout.strip()
+                        break
+                else:
+                    check = subprocess.run(
+                        ["docker", "exec", cid, "test", "-d", path_pattern],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if check.returncode == 0:
+                        found_path = path_pattern
+                        break
+            except Exception:
+                continue
+
+        if not found_path:
+            continue
+
+        # Also check for sessions dir (for session name resolution)
+        sessions_path = str(Path(found_path).parent / "sessions")
+
+        # docker cp the projects directory
+        dest = _DOCKER_CACHE_DIR / f"docker-{short_id}"
+        projects_dest = dest / "projects"
+        sessions_dest = dest / "sessions"
+
+        try:
+            # Remove old cache for this container
+            if dest.is_dir():
+                shutil.rmtree(dest)
+            dest.mkdir(parents=True, exist_ok=True)
+
+            # Copy projects
+            subprocess.run(
+                ["docker", "cp", f"{cid}:{found_path}", str(projects_dest)],
+                capture_output=True, timeout=30
+            )
+
+            # Copy sessions dir (for name resolution)
+            subprocess.run(
+                ["docker", "cp", f"{cid}:{sessions_path}", str(sessions_dest)],
+                capture_output=True, timeout=10
+            )
+
+            _docker_container_info[short_id] = {
+                "name": container_name,
+                "projects_path": str(projects_dest),
+                "sessions_path": str(sessions_dest),
+            }
+        except Exception:
+            continue
+
+    _docker_cache_ts = now
+    return _DOCKER_CACHE_DIR
 
 
 # ─── Utilities ───────────────────────────────────────────────────────────────
@@ -1130,6 +1248,9 @@ def _extract_user_message_text(entry: dict) -> str:
     """Extract user message text from a JSONL entry."""
     if entry.get("type") != "user":
         return ""
+    # Skip meta messages (local-command-caveat, etc.)
+    if entry.get("isMeta"):
+        return ""
     msg = entry.get("message", {})
     if isinstance(msg, dict):
         content = msg.get("content", "")
@@ -1137,12 +1258,20 @@ def _extract_user_message_text(entry: dict) -> str:
         content = entry.get("content", "")
 
     if isinstance(content, str):
+        # Skip local-command-caveat content
+        if "<local-command-caveat>" in content:
+            return ""
         return content
     if isinstance(content, list):
         for block in content:
             if isinstance(block, dict) and block.get("type") == "text":
-                return block.get("text", "")
+                text = block.get("text", "")
+                if "<local-command-caveat>" in text:
+                    return ""
+                return text
             elif isinstance(block, str):
+                if "<local-command-caveat>" in block:
+                    return ""
                 return block
     return ""
 
@@ -1292,6 +1421,130 @@ def get_session_detail() -> dict:
                 })
             except Exception:
                 continue
+
+    # Also scan Docker container sessions
+    try:
+        _sync_docker_sessions()
+        for cid, info in _docker_container_info.items():
+            docker_projects = Path(info["projects_path"])
+            if not docker_projects.is_dir():
+                continue
+
+            # Build sid_to_name from docker sessions dir
+            docker_sessions_dir = Path(info.get("sessions_path", ""))
+            if docker_sessions_dir.is_dir():
+                for sf in docker_sessions_dir.glob("*.json"):
+                    try:
+                        sd = json.loads(read_text(sf) or "{}")
+                        sid = sd.get("sessionId")
+                        name = sd.get("name")
+                        if sid and name:
+                            sid_to_name[sid] = name
+                    except Exception:
+                        continue
+
+            for proj_dir in docker_projects.iterdir():
+                if not proj_dir.is_dir():
+                    continue
+                for jsonl_file in proj_dir.glob("*.jsonl"):
+                    if "subagent" in str(jsonl_file):
+                        continue
+                    try:
+                        session_id = jsonl_file.stem
+                        file_size = jsonl_file.stat().st_size
+                        file_size_kb = round(file_size / 1024, 1)
+
+                        decoded_path = decode_project_path(proj_dir.name)
+                        project_name = f"\U0001f433 {info['name']}: {Path(decoded_path).name or proj_dir.name}"
+
+                        # Extract slug
+                        last_5 = _read_last_n_lines(jsonl_file, 5)
+                        slug = ""
+                        last_timestamp = ""
+                        custom_title = ""
+                        for line in reversed(last_5):
+                            try:
+                                entry = json.loads(line)
+                                if not slug and entry.get("slug"):
+                                    slug = entry["slug"]
+                                if not last_timestamp and entry.get("timestamp"):
+                                    last_timestamp = entry["timestamp"]
+                            except Exception:
+                                continue
+
+                        if not custom_title:
+                            try:
+                                with open(jsonl_file, "rb") as _f:
+                                    _head = _f.read(min(jsonl_file.stat().st_size, 5000)).decode("utf-8", errors="replace")
+                                _matches = re.findall(r'"customTitle":"([^"]*)"', _head)
+                                if _matches:
+                                    custom_title = _matches[-1]
+                            except Exception:
+                                pass
+                        slug = sid_to_name.get(session_id) or custom_title or slug
+
+                        # Message count
+                        last_500 = _read_last_n_lines(jsonl_file, 500)
+                        message_count = sum(1 for line in last_500
+                            if '"type"' in line and ('"user"' in line or '"assistant"' in line))
+
+                        # First/last messages
+                        first_20 = _read_first_n_lines(jsonl_file, 20)
+                        first_message = ""
+                        for line in first_20:
+                            try:
+                                entry = json.loads(line)
+                                text = _extract_user_message_text(entry)
+                                if text and len(text) >= 3 and not text.startswith("{"):
+                                    first_message = text[:120]
+                                    break
+                            except Exception:
+                                continue
+
+                        last_20 = _read_last_n_lines(jsonl_file, 20)
+                        last_message = ""
+                        for line in reversed(last_20):
+                            try:
+                                entry = json.loads(line)
+                                text = _extract_user_message_text(entry)
+                                if text and len(text) >= 3 and not text.startswith("{"):
+                                    last_message = text[:120]
+                                    break
+                            except Exception:
+                                continue
+
+                        # Fork count
+                        last_1000 = _read_last_n_lines(jsonl_file, 1000)
+                        parent_children: dict[str, int] = {}
+                        for line in last_1000:
+                            try:
+                                entry = json.loads(line)
+                                parent_uuid = entry.get("parentUuid")
+                                if parent_uuid:
+                                    parent_children[parent_uuid] = parent_children.get(parent_uuid, 0) + 1
+                            except Exception:
+                                continue
+                        fork_count = sum(1 for c in parent_children.values() if c > 1)
+
+                        sessions.append({
+                            "session_id": session_id,
+                            "slug": slug,
+                            "project": decoded_path,
+                            "project_name": project_name,
+                            "file_size_kb": file_size_kb,
+                            "message_count": message_count,
+                            "first_message": first_message,
+                            "last_message": last_message,
+                            "last_timestamp": last_timestamp,
+                            "is_active": False,  # Can't detect active state from docker cp
+                            "fork_count": fork_count,
+                            "pid": None,
+                            "is_docker": True,
+                        })
+                    except Exception:
+                        continue
+    except Exception:
+        pass
 
     # Sort: active first, then last_timestamp descending
     sessions.sort(key=lambda x: (not x["is_active"], -(x.get("last_timestamp") or 0) if isinstance(x.get("last_timestamp"), (int,float)) else x.get("last_timestamp", "") or ""), reverse=False)
@@ -2048,8 +2301,6 @@ def _parse_token_usage(period: str) -> dict:
     period_start_ts = period_start.timestamp()
 
     projects_dir = CLAUDE_DIR / "projects"
-    if not projects_dir.is_dir():
-        return _empty_token_response(period)
 
     # Aggregation accumulators
     seen_ids: set[str] = set()
@@ -2069,11 +2320,29 @@ def _parse_token_usage(period: str) -> dict:
     shell_cmds_map: dict[str, int] = {}
     mcp_servers_map: dict[str, int] = {}
 
-    for proj_dir in projects_dir.iterdir():
-        if not proj_dir.is_dir():
-            continue
+    # Collect all project directories (local + docker)
+    all_proj_dirs: list[Path] = []
+    docker_project_names: dict[str, str] = {}  # proj_dir_path -> display_name
+    if projects_dir.is_dir():
+        for pd in projects_dir.iterdir():
+            if pd.is_dir():
+                all_proj_dirs.append(pd)
+    try:
+        _sync_docker_sessions()
+        for cid, info in _docker_container_info.items():
+            dp = Path(info["projects_path"])
+            if dp.is_dir():
+                for pd in dp.iterdir():
+                    if pd.is_dir():
+                        all_proj_dirs.append(pd)
+                        decoded = decode_project_path(pd.name)
+                        docker_project_names[str(pd)] = f"\U0001f433 {info['name']}: {Path(decoded).name or pd.name}"
+    except Exception:
+        pass
 
-        project_name = Path(decode_project_path(proj_dir.name)).name or proj_dir.name
+    for proj_dir in all_proj_dirs:
+
+        project_name = docker_project_names.get(str(proj_dir)) or (Path(decode_project_path(proj_dir.name)).name or proj_dir.name)
 
         for jsonl_file in proj_dir.glob("*.jsonl"):
             if "subagent" in jsonl_file.name:
