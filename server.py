@@ -264,6 +264,48 @@ def _is_valid_project_path(path: str) -> bool:
     return bool(_PROJECT_PATH_RE.match(path))
 
 
+def _sanitize_jsonl_for_resume(src_path: Path) -> Path:
+    """Copy session JSONL to a tempfile, fixing fields that break claude's resume renderer.
+
+    Known issue: tool_use_result entries with `originalFile: null` crash the resume UI
+    (`null is not an object (evaluating 'A.split')`). Replace null with empty string.
+
+    Returns the tempfile path; caller must delete it.
+    """
+    fd, tmp_str = tempfile.mkstemp(suffix=".jsonl", prefix="gleaner_xfer_")
+    os.close(fd)
+    tmp_path = Path(tmp_str)
+
+    def _walk(x):
+        if isinstance(x, dict):
+            for k in list(x.keys()):
+                if k == "originalFile" and x[k] is None:
+                    x[k] = ""
+                else:
+                    _walk(x[k])
+        elif isinstance(x, list):
+            for v in x:
+                _walk(v)
+
+    try:
+        with src_path.open("rb") as f_in, tmp_path.open("wb") as f_out:
+            for raw in f_in:
+                try:
+                    obj = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    f_out.write(raw)
+                    continue
+                _walk(obj)
+                f_out.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+        return tmp_path
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
+        raise
+
+
 def decode_project_path(folder_name: str) -> str:
     """Convert a project folder name to its actual path. '-home-sungjoo-repo' → '/home/sungjoo/repo'
 
@@ -2969,7 +3011,18 @@ class GleanerHandler(BaseHTTPRequestHandler):
             # mkdir both: (1) session storage dir under ~/.claude/projects, (2) target project dir for cd
             ssh_mkdir = ["ssh", *ssh_opts, host,
                          f"mkdir -p {remote_dir} && mkdir -p {target_decoded}"]
-            scp_jsonl = ["scp", *ssh_opts, str(source_jsonl), f"{host}:{remote_dir}/"]
+
+            # Sanitize session JSONL into a tempfile — claude's resume renderer crashes
+            # on tool_use_result entries with `originalFile: null`. Replace with "".
+            try:
+                sanitized_jsonl = _sanitize_jsonl_for_resume(source_jsonl)
+            except Exception as e:
+                self._json_response({"error": f"failed to sanitize session: {e}"}, 500)
+                return
+
+            # scp the sanitized file but keep the original filename on the remote
+            scp_jsonl = ["scp", *ssh_opts, str(sanitized_jsonl),
+                         f"{host}:{remote_dir}/{source_jsonl.name}"]
             scp_subagent = None
             if source_subagent_dir.is_dir():
                 scp_subagent = ["scp", *ssh_opts, "-r", str(source_subagent_dir), f"{host}:{remote_dir}/"]
@@ -3058,6 +3111,11 @@ class GleanerHandler(BaseHTTPRequestHandler):
                 self._json_response({"error": "ssh or scp not found on this machine"}, 500)
             except Exception as e:
                 self._json_response({"error": str(e)}, 500)
+            finally:
+                try:
+                    sanitized_jsonl.unlink()
+                except Exception:
+                    pass
             return
 
         if path == "/api/delete-project":
